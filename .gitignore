@@ -1,0 +1,33 @@
+# SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+
+# Build and release artifacts
+build/
+dist/
+DerivedData/
+*.dmg
+*.zip
+*.sha256
+
+# Xcode user data
+*.xcuserstate
+xcuserdata/
+
+# Tool caches
+.swiftformat-cache
+.swiftlint-cache/
+
+# Local environment and signing material
+.env
+.env.*
+!.env.example
+*.p12
+*.cer
+*.mobileprovision
+
+# Editors and macOS
+.vscode/
+.idea/
+.DS_Store

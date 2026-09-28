@@ -1,0 +1,134 @@
+SHELL := /bin/bash
+.DEFAULT_GOAL := build
+
+APP_NAME ?= Arcload
+PRODUCT_NAME ?= Arcload
+BUNDLE_ID ?= com.ypjcoding.arcload
+CONFIGURATION ?= debug
+VERSION ?= $(shell head -n 1 VERSION 2>/dev/null)
+NOTARY_PROFILE ?= arcload-notary
+RELEASE_SWIFT_FLAGS ?= -Xswiftc -cross-module-optimization
+RELEASE_LINKER_FLAGS ?= -Xlinker -dead_strip
+APP := build/$(APP_NAME).app
+RELEASE_EXECUTABLE := $(APP)/Contents/MacOS/$(APP_NAME)
+RELEASE_DSYM := build/Symbols/$(APP_NAME).app.dSYM
+LSREGISTER := /System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister
+
+.PHONY: help doctor quality-tools check release-check hardening-check verify-hardening validate skills workflow-test \
+        format lint test package-build build release run install uninstall register icon notary-setup dist clean
+
+help:
+	@echo "SwiftPM workflows (macOS):"
+	@echo "  make / make build     Build and ad-hoc sign build/$(APP_NAME).app"
+	@echo "  make package-build    Compile the app with SwiftPM only"
+	@echo "  make test             Run AppCore tests with SwiftPM"
+	@echo "  make check            Validate, lint, test, and compile"
+	@echo "  make release-check    Run every automated preflight for distribution"
+	@echo "  make hardening-check  Build and verify a stripped release application"
+	@echo "  make verify-hardening Verify the current release app and private dSYM"
+	@echo "  make run              Build and launch the app"
+	@echo "  make install          Install the app in /Applications"
+	@echo "  make uninstall        Remove it from /Applications"
+	@echo "  make register         Refresh LaunchServices for the local build"
+	@echo ""
+	@echo "Quality and maintenance:"
+	@echo "  make doctor           Check macOS and Apple command-line tools"
+	@echo "  make validate         Repository/static/skill checks"
+	@echo "  make workflow-test    Test Make orchestration with mocked tools"
+	@echo "  make format           Apply SwiftFormat and safe SwiftLint fixes"
+	@echo "  make lint             Verify SwiftFormat and SwiftLint"
+	@echo "  make icon PNG=...     Create a macOS .icns file"
+	@echo ""
+	@echo "Distribution:"
+	@echo "  make notary-setup     Store notarization credentials in Keychain"
+	@echo "  make dist             Sign, notarise, staple, and checksum a DMG"
+	@echo "  make clean"
+
+doctor:
+	@[[ "$$(uname -s)" == "Darwin" ]] || { echo "error: the app requires macOS"; exit 1; }
+	@command -v swift >/dev/null || { echo "error: install Swift 6.2 or newer"; exit 1; }
+	@swift --version | awk '/Swift version/ { split($$3, v, "."); if (v[1] < 6 || (v[1] == 6 && v[2] < 2)) exit 1 }' || { echo "error: Swift 6.2 or newer is required"; exit 1; }
+	@command -v codesign >/dev/null || { echo "error: codesign is unavailable"; exit 1; }
+	@command -v xcrun >/dev/null || { echo "error: xcrun is unavailable"; exit 1; }
+	@swift --version
+
+quality-tools:
+	@command -v swiftformat >/dev/null || { \
+	  echo "error: SwiftFormat is required for this optional quality target"; exit 1; }
+	@command -v swiftlint >/dev/null || { \
+	  echo "error: SwiftLint is required for this optional quality target"; exit 1; }
+
+check: validate lint test package-build
+
+release-check: CONFIGURATION := release
+release-check: validate workflow-test lint test package-build hardening-check
+
+hardening-check: CONFIGURATION := release
+hardening-check: release
+
+verify-hardening: doctor
+	./scripts/verify-macos-hardening.sh "$(RELEASE_EXECUTABLE)" "$(RELEASE_DSYM)"
+
+validate:
+	./scripts/static-checks.sh
+
+skills:
+	./scripts/check-skills.sh
+
+workflow-test:
+	./scripts/test-make-workflows.sh
+
+format: quality-tools
+	swiftformat --config .swiftformat Sources Tests Package.swift
+	swiftlint --fix --config .swiftlint.yml
+
+lint: quality-tools
+	swiftformat --lint --config .swiftformat Sources Tests Package.swift
+	swiftlint lint --strict --config .swiftlint.yml
+
+test:
+	swift run --arch arm64 SmokeTests
+
+package-build:
+	swift build --arch arm64 --product "$(PRODUCT_NAME)" --configuration "$(CONFIGURATION)"
+
+build: doctor
+	APP_NAME="$(APP_NAME)" PRODUCT_NAME="$(PRODUCT_NAME)" BUNDLE_ID="$(BUNDLE_ID)" \
+	  CONFIGURATION="$(CONFIGURATION)" VERSION="$(VERSION)" \
+	  RELEASE_SWIFT_FLAGS="$(RELEASE_SWIFT_FLAGS)" RELEASE_LINKER_FLAGS="$(RELEASE_LINKER_FLAGS)" \
+	  ./scripts/build-macos-app.sh
+
+release: CONFIGURATION := release
+release: build
+	./scripts/verify-macos-hardening.sh "$(RELEASE_EXECUTABLE)" "$(RELEASE_DSYM)"
+
+run: build
+	open "$(APP)"
+
+install: build
+	rm -rf "/Applications/$(APP_NAME).app"
+	cp -R "$(APP)" /Applications/
+	"$(LSREGISTER)" -f "/Applications/$(APP_NAME).app"
+	@echo "Installed and registered /Applications/$(APP_NAME).app"
+
+uninstall:
+	rm -rf "/Applications/$(APP_NAME).app"
+
+register: build
+	"$(LSREGISTER)" -f "$(APP)"
+	@echo "Registered $(APP) with LaunchServices"
+
+icon: doctor
+	@test -n "$(PNG)" || { echo "usage: make icon PNG=path/to/icon-1024.png"; exit 64; }
+	./scripts/make-icons.sh "$(PNG)"
+
+notary-setup: doctor
+	NOTARY_PROFILE="$(NOTARY_PROFILE)" ./scripts/notary-setup.sh
+
+dist: CONFIGURATION := release
+dist: doctor release-check
+	APP_NAME="$(APP_NAME)" PRODUCT_NAME="$(PRODUCT_NAME)" BUNDLE_ID="$(BUNDLE_ID)" \
+	  VERSION="$(VERSION)" NOTARY_PROFILE="$(NOTARY_PROFILE)" ./scripts/release-macos.sh
+
+clean:
+	rm -rf .build build dist
