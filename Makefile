@@ -87,6 +87,7 @@ lint: quality-tools
 	swiftlint lint --strict --config .swiftlint.yml
 
 test:
+	swift test --arch arm64
 	swift run --arch arm64 SmokeTests
 
 package-build:

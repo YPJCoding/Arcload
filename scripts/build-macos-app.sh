@@ -63,14 +63,21 @@ done
 if [[ -f "$icon" ]]; then
   cp "$icon" "$app/Contents/Resources/AppIcon.icns"
 fi
-if [[ -x Resources/aria2c ]]; then
-  cp Resources/aria2c "$app/Contents/MacOS/aria2c"
-  chmod +x "$app/Contents/MacOS/aria2c"
-  codesign --force --sign "$sign_identity" "$app/Contents/MacOS/aria2c"
-fi
-if [[ -f Resources/aria2-COPYING ]]; then
-  cp Resources/aria2-COPYING "$app/Contents/Resources/aria2-COPYING"
-fi
+[[ -x Resources/aria2-next ]] || { echo "error: missing pinned aria2-next engine" >&2; exit 1; }
+engine_checksum="$(plutil -extract sha256 raw Resources/aria2-next-release.json)"
+[[ "$(shasum -a 256 Resources/aria2-next | awk '{print $1}')" == "$engine_checksum" ]] || {
+  echo "error: aria2-next checksum does not match pinned release" >&2
+  exit 1
+}
+[[ "$(lipo -archs Resources/aria2-next)" == "arm64" ]] || {
+  echo "error: aria2-next must be arm64-only" >&2
+  exit 1
+}
+cp Resources/aria2-next "$app/Contents/MacOS/aria2-next"
+chmod +x "$app/Contents/MacOS/aria2-next"
+codesign --force --sign "$sign_identity" "$app/Contents/MacOS/aria2-next"
+cp Resources/aria2-next-COPYING Resources/aria2-next-release.json "$app/Contents/Resources/"
+cp NOTICE.md "$app/Contents/Resources/ThirdPartyNotices.md"
 
 if [[ "$configuration" == "release" ]]; then
   ./scripts/harden-macos-binary.sh \

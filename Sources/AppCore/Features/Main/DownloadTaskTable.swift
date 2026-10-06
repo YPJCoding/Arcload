@@ -5,14 +5,15 @@ import UniformTypeIdentifiers
 struct DownloadTaskTable<Menu: View>: View {
   let tasks: [DownloadTask]
   @Binding var selection: Set<DownloadTask.ID>
+  @Binding var sortOrder: [KeyPathComparator<DownloadTask>]
   let primaryAction: (DownloadTask) -> Void
   @ViewBuilder var contextMenu: ([DownloadTask]) -> Menu
 
   @State private var errorInfoTaskID: DownloadTask.ID?
 
   var body: some View {
-    Table(tasks, selection: $selection) {
-      TableColumn("文件名") { task in
+    Table(tasks, selection: $selection, sortOrder: $sortOrder) {
+      TableColumn("文件名", value: \.title, comparator: .localizedStandard) { task in
         HStack(spacing: 6) {
           Image(nsImage: Self.fileIcon(for: task.title))
             .resizable()
@@ -22,40 +23,44 @@ struct DownloadTaskTable<Menu: View>: View {
             .truncationMode(.middle)
         }
       }
-      .width(min: 180, ideal: 280)
+      .width(min: 120, ideal: 165)
 
-      TableColumn("大小") { task in
+      TableColumn("大小", value: \.sortSize) { task in
         Text(DownloadFormatting.byteCount(task.sortSize))
           .monospacedDigit()
           .frame(maxWidth: .infinity, alignment: .trailing)
       }
-      .width(min: 72, ideal: 88)
+      .width(min: 64, ideal: 76, max: 88)
 
       TableColumn("状态") { task in
         statusText(task)
       }
-      .width(min: 72, ideal: 96)
+      .width(min: 60, ideal: 72, max: 84)
 
       TableColumn("速度") { task in
         Text(DownloadFormatting.speed(task.speedBytesPerSecond, isDownloading: task.status == .downloading))
           .monospacedDigit()
           .frame(maxWidth: .infinity, alignment: .trailing)
       }
-      .width(min: 80, ideal: 96)
+      .width(min: 76, ideal: 88, max: 104)
+
+      TableColumn("剩余时间") { task in
+        Text(DownloadFormatting.remainingTime(task.remainingSeconds))
+          .monospacedDigit()
+          .foregroundStyle(.secondary)
+          .frame(maxWidth: .infinity, alignment: .trailing)
+          .help("根据当前下载速度估算，实际时间可能变化。")
+      }
+      .width(min: 88, ideal: 104, max: 120)
 
       TableColumn("进度") { task in
-        HStack(spacing: 8) {
-          ProgressView(value: task.progress)
-            .progressViewStyle(.linear)
-            .controlSize(.small)
-          Text("\(Int((task.progress * 100).rounded()))%")
-            .monospacedDigit()
-            .frame(width: 40, alignment: .trailing)
-        }
+        DownloadPieProgressView(progress: task.progress, status: task.status)
+          .frame(maxWidth: .infinity, alignment: .center)
       }
-      .width(min: 120, ideal: 160)
+      .width(min: 44, ideal: 52, max: 64)
     }
-    .tableStyle(.inset(alternatesRowBackgrounds: true))
+    .tableStyle(.inset(alternatesRowBackgrounds: !tasks.isEmpty))
+    .background(DownloadSortHeaderHelp(sortOrder: sortOrder))
     .contextMenu(forSelectionType: DownloadTask.ID.self) { ids in
       let selectedTasks = tasks.filter { ids.contains($0.id) }
       if !selectedTasks.isEmpty {

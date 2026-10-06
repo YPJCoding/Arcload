@@ -1,35 +1,45 @@
 import Foundation
 
 public actor Aria2Engine {
-  private let onTasks: @MainActor @Sendable ([DownloadTask]) -> Void
+  private let onTasks: @MainActor @Sendable ([DownloadTask]) async -> Void
   private let onState: @MainActor @Sendable (EngineState) -> Void
+  private let onSubmitted: @MainActor @Sendable (String) -> Void
   private var process: Process?
   private var poll: Task<Void, Never>?
   private var launch: LaunchConfig?
   private var appliedRuntimeOptions: RuntimeOptions?
   private var isRunning = false
+  private var hasVerifiedRPC = false
   private var state: EngineState = .stopped
   private var consecutiveFailures = 0
   private var nextRecoveryAttempt = Date.distantPast
   private var blockedConfig: LaunchConfig?
   private var hasReachedRunningState = false
+  private var isStopping = false
+  private var isTransitioningProcess = false
+  private var generation: UInt64 = 0
+  private var taskOptions: [String: [String: String]] = [:]
 
   public init(
-    onTasks: @escaping @MainActor @Sendable ([DownloadTask]) -> Void,
-    onState: @escaping @MainActor @Sendable (EngineState) -> Void
+    onTasks: @escaping @MainActor @Sendable ([DownloadTask]) async -> Void,
+    onState: @escaping @MainActor @Sendable (EngineState) -> Void,
+    onSubmitted: @escaping @MainActor @Sendable (String) -> Void = { _ in }
   ) {
     self.onTasks = onTasks
     self.onState = onState
+    self.onSubmitted = onSubmitted
   }
 
   public func start() async {
+    guard !isRunning, !isStopping else { return }
     isRunning = true
+    generation &+= 1
     consecutiveFailures = 0
     nextRecoveryAttempt = .distantPast
     blockedConfig = nil
     hasReachedRunningState = false
     await setState(.starting)
-    poll?.cancel()
+    guard isRunning, !isStopping else { return }
     poll = Task { [weak self] in
       while !Task.isCancelled {
         guard let self else { return }
@@ -40,49 +50,94 @@ public actor Aria2Engine {
   }
 
   public func stop() async {
-    isRunning = false
-    poll?.cancel()
-    poll = nil
-    let launch = self.launch
-    let process = self.process
-    self.process = nil
-    self.launch = nil
-    appliedRuntimeOptions = nil
-    consecutiveFailures = 0
-    nextRecoveryAttempt = .distantPast
-    blockedConfig = nil
-    hasReachedRunningState = false
-    if let launch {
-      await shutdown(port: launch.port, secret: launch.secret)
-    }
-    if process?.isRunning == true {
-      process?.terminate()
-    }
-    await setState(.stopped)
+    await stop(forAppTermination: false)
   }
 
-  public func add(url: URL, paused: Bool) async throws {
-    guard let launch else { throw Aria2EngineError.rpcUnavailable }
-    var options = ["dir": launch.directory]
+  public func stopForAppTermination() async {
+    await stop(forAppTermination: true)
+  }
+
+  private func stop(forAppTermination: Bool) async {
+    guard !isStopping else { return }
+    isStopping = true
+    defer { isStopping = false }
+    isRunning = false
+    generation &+= 1
+    let previousPoll = poll
+    poll = nil
+    previousPoll?.cancel()
+    resetRecoveryTracking()
+    hasReachedRunningState = false
+    if forAppTermination {
+      let ownedProcess = process
+      await EngineTerminationCleanup.run(
+        cleanup: { [self] in
+          await previousPoll?.value
+          do {
+            try Task.checkCancellation()
+            try await stopManagedProcess(requireSessionSave: false, forAppTermination: true)
+          } catch {
+            guard !Task.isCancelled else { return }
+            await EngineTerminationCleanup.terminateOwnedProcess(ownedProcess)
+          }
+        },
+        fallback: {
+          await EngineTerminationCleanup.terminateOwnedProcess(ownedProcess)
+        },
+      )
+      if ownedProcess?.isRunning != true {
+        process = nil
+        launch = nil
+        appliedRuntimeOptions = nil
+        await setState(.stopped)
+      } else {
+        await setState(.failed(Self.message(for: Aria2EngineError.processExitTimedOut)))
+      }
+      return
+    }
+    // Normal stops and restarts still drain the tick and confirm every step.
+    await previousPoll?.value
+    do {
+      try await stopManagedProcess(requireSessionSave: false)
+      await setState(.stopped)
+    } catch {
+      // Keep the Process reference if it did not exit; never report a false stop.
+      await setState(.failed(Self.message(for: error)))
+    }
+  }
+  @discardableResult
+  public func add(url: URL, paused: Bool, options suppliedOptions: [String: String] = [:]) async throws -> String {
+    let launch = try operationLaunch()
+    var options = DownloadCertificatePolicy(defaults: .standard).submissionOptions(
+      Aria2NextOptions(defaults: .standard).submissionOptions(suppliedOptions)
+    )
+    if options["dir"] == nil { options["dir"] = launch.directory }
+    let gid: String
     if paused {
       options["pause"] = "true"
     }
     do {
-      _ = try await rpc(
+      let result = try await rpc(
         port: launch.port,
         method: "aria2.addUri",
-        params: [token(launch.secret), [url.absoluteString], options],
+        params: authenticationParameters(launch.secret) + [[url.absoluteString], options],
       )
+      guard let newGID = result as? String, !newGID.isEmpty else {
+        throw Aria2EngineError.rpcFailed("aria2 未返回任务 ID，请检查任务列表后重试。")
+      }
+      gid = newGID
     } catch {
       throw Aria2EngineError.operationFailed("添加下载失败：\(Self.message(for: error))")
     }
+    await onSubmitted(gid)
     try? await publishTasks()
+    return gid
   }
 
   public func pause(gid: String) async throws {
-    guard let launch else { throw Aria2EngineError.rpcUnavailable }
+    let launch = try operationLaunch()
     do {
-      _ = try await rpc(port: launch.port, method: "aria2.pause", params: [token(launch.secret), gid])
+      _ = try await rpc(port: launch.port, method: "aria2.pause", params: authenticationParameters(launch.secret) + [gid])
     } catch {
       throw Aria2EngineError.operationFailed("暂停下载失败：\(Self.message(for: error))")
     }
@@ -90,9 +145,9 @@ public actor Aria2Engine {
   }
 
   public func resume(gid: String) async throws {
-    guard let launch else { throw Aria2EngineError.rpcUnavailable }
+    let launch = try operationLaunch()
     do {
-      _ = try await rpc(port: launch.port, method: "aria2.unpause", params: [token(launch.secret), gid])
+      _ = try await rpc(port: launch.port, method: "aria2.unpause", params: authenticationParameters(launch.secret) + [gid])
     } catch {
       throw Aria2EngineError.operationFailed("继续下载失败：\(Self.message(for: error))")
     }
@@ -100,9 +155,9 @@ public actor Aria2Engine {
   }
 
   public func pauseAll() async throws {
-    guard let launch else { throw Aria2EngineError.rpcUnavailable }
+    let launch = try operationLaunch()
     do {
-      _ = try await rpc(port: launch.port, method: "aria2.pauseAll", params: [token(launch.secret)])
+      _ = try await rpc(port: launch.port, method: "aria2.pauseAll", params: authenticationParameters(launch.secret))
     } catch {
       throw Aria2EngineError.operationFailed("暂停全部下载失败：\(Self.message(for: error))")
     }
@@ -110,9 +165,9 @@ public actor Aria2Engine {
   }
 
   public func resumeAll() async throws {
-    guard let launch else { throw Aria2EngineError.rpcUnavailable }
+    let launch = try operationLaunch()
     do {
-      _ = try await rpc(port: launch.port, method: "aria2.unpauseAll", params: [token(launch.secret)])
+      _ = try await rpc(port: launch.port, method: "aria2.unpauseAll", params: authenticationParameters(launch.secret))
     } catch {
       throw Aria2EngineError.operationFailed("继续全部下载失败：\(Self.message(for: error))")
     }
@@ -124,13 +179,13 @@ public actor Aria2Engine {
   }
 
   public func remove(gid: String, status: DownloadTaskStatus) async throws {
-    guard let launch else { throw Aria2EngineError.rpcUnavailable }
+    let launch = try operationLaunch()
     let method = (status == .complete || status == .error) ? "aria2.removeDownloadResult" : "aria2.remove"
     do {
-      _ = try await rpc(port: launch.port, method: method, params: [token(launch.secret), gid])
+      _ = try await rpc(port: launch.port, method: method, params: authenticationParameters(launch.secret) + [gid])
     } catch {
       do {
-        _ = try await rpc(port: launch.port, method: "aria2.forceRemove", params: [token(launch.secret), gid])
+        _ = try await rpc(port: launch.port, method: "aria2.forceRemove", params: authenticationParameters(launch.secret) + [gid])
       } catch {
         throw Aria2EngineError.operationFailed("移除下载失败：\(Self.message(for: error))")
       }
@@ -139,7 +194,7 @@ public actor Aria2Engine {
   }
 
   private func tick() async {
-    guard isRunning else { return }
+    guard isRunning, !Task.isCancelled else { return }
     let config = Self.currentConfig()
 
     if let blockedConfig, blockedConfig != config {
@@ -166,19 +221,36 @@ public actor Aria2Engine {
     }
 
     do {
+      try checkRunning()
       if needsLaunch {
         try await launchProcess(config)
       }
+      try checkRunning()
       guard launch != nil else { throw Aria2EngineError.rpcUnavailable }
       try await applyOptions(config)
+      try checkRunning()
       self.launch = config
       try await publishTasks()
+      try checkRunning()
       resetRecoveryTracking()
       hasReachedRunningState = true
       await setState(.running)
     } catch {
+      guard isRunning, !Task.isCancelled, !(error is CancellationError) else { return }
       await handleTickFailure(error, config: config)
     }
+  }
+
+  private func checkRunning() throws {
+    try Task.checkCancellation()
+    guard isRunning, !isStopping else { throw CancellationError() }
+  }
+
+  private func operationLaunch() throws -> LaunchConfig {
+    guard isRunning, !isStopping, !isTransitioningProcess, let launch else {
+      throw Aria2EngineError.rpcUnavailable
+    }
+    return launch
   }
 
   private func handleTickFailure(_ error: Error, config: LaunchConfig) async {
@@ -195,14 +267,22 @@ public actor Aria2Engine {
     }
 
     consecutiveFailures += 1
+    var failure = error
     if consecutiveFailures >= 3, process?.isRunning == true {
-      stopProcess()
-      launch = nil
+      isTransitioningProcess = true
+      generation &+= 1
+      do {
+        try await stopManagedProcess(requireSessionSave: false)
+      } catch {
+        failure = error
+      }
+      isTransitioningProcess = false
+      guard isRunning, !Task.isCancelled else { return }
     }
 
     nextRecoveryAttempt = Date().addingTimeInterval(Self.recoveryDelay(for: consecutiveFailures))
     if consecutiveFailures >= 3 {
-      await setState(.failed(Self.message(for: error)))
+      await setState(.failed(Self.message(for: failure)))
     } else {
       await setState(.recovering)
     }
@@ -215,14 +295,23 @@ public actor Aria2Engine {
   }
 
   private func publishTasks() async throws {
-    guard isRunning, let launch else { return }
+    guard isRunning, !isTransitioningProcess, let launch else { return }
+    let expectedGeneration = generation
     let live = try await fetchTasks(launch)
+    try checkRunning()
+    guard generation == expectedGeneration, !isTransitioningProcess else { return }
     await onTasks(live)
   }
 
   private func launchProcess(_ config: LaunchConfig) async throws {
-    stopProcess()
     guard let binary = Self.binaryURL() else { throw Aria2EngineError.binaryMissing }
+    isTransitioningProcess = true
+    generation &+= 1
+    defer { isTransitioningProcess = false }
+    // Settings restarts require a saved session; RPC recovery can use the last snapshot.
+    let isSettingsRestart = launch?.requiresProcessRestart(comparedTo: config) == true
+    try await stopManagedProcess(requireSessionSave: isSettingsRestart)
+    try checkRunning()
     do {
       try FileManager.default.createDirectory(at: config.supportDirectory, withIntermediateDirectories: true)
       try FileManager.default.createDirectory(atPath: config.directory, withIntermediateDirectories: true)
@@ -251,25 +340,26 @@ public actor Aria2Engine {
       "--enable-rpc=true",
       "--rpc-listen-all=false",
       "--rpc-listen-port=\(config.port)",
-      "--rpc-secret=\(config.secret)",
       "--rpc-allow-origin-all=true",
       "--dir=\(config.directory)",
-      "--check-certificate=false",
-      "--continue=true",
-      "--split=16",
-      "--min-split-size=1M",
+      "--continue=false",
+      "--allow-overwrite=false",
+      "--auto-file-renaming=true",
+      "--media=file",
+      "--follow-metalink=false",
+      "--state-dir=\(config.supportDirectory.appendingPathComponent("state").path)",
       "--follow-torrent=false",
       "--enable-dht=false",
       "--enable-dht6=false",
       "--bt-enable-lpd=false",
       "--enable-peer-exchange=false",
       "--max-concurrent-downloads=\(config.maxConcurrentDownloads)",
-      "--max-connection-per-server=\(config.maxConnectionsPerServer)",
-      "--max-download-limit=\(config.maxDownloadSpeedBytes)",
       "--save-session=\(config.sessionFile.path)",
       "--save-session-interval=5",
       "--input-file=\(config.inputFile.path)",
-    ]
+    ] + Aria2RPCAuthentication(secret: config.secret).launchArguments
+      + config.certificatePolicy.launchArguments
+      + config.speedLimits.launchArguments + config.streamOptions.launchArguments
     process.standardOutput = FileHandle.nullDevice
     process.standardError = FileHandle.nullDevice
     do {
@@ -278,61 +368,129 @@ public actor Aria2Engine {
       throw Aria2EngineError.launchFailed(error.localizedDescription)
     }
     self.process = process
+    hasVerifiedRPC = false
     self.launch = config
     appliedRuntimeOptions = config.runtimeOptions
     do {
       try await waitUntilReady(config)
+      hasVerifiedRPC = true
     } catch {
-      stopProcess()
-      self.launch = nil
+      // stop() drains this task and performs teardown itself when cancelled.
+      try checkRunning()
+      try await stopManagedProcess(requireSessionSave: false)
       throw error
     }
   }
 
   private func waitUntilReady(_ config: LaunchConfig) async throws {
     for _ in 0 ..< 30 {
+      try checkRunning()
       guard process?.isRunning == true else {
         throw Aria2EngineError.launchFailed("aria2 进程在 RPC 就绪前退出。")
       }
-      if (try? await rpc(port: config.port, method: "aria2.getVersion", params: [token(config.secret)])) != nil {
+      if let version = try? await rpc(
+        port: config.port,
+        method: "aria2.getVersion",
+        params: authenticationParameters(config.secret),
+        timeoutInterval: 1,
+      ) as? [String: Any] {
+        try checkRunning()
+        guard version["product"] as? String == "aria2-next",
+              version["version"] as? String == Aria2NextDeployment.version else {
+          throw Aria2EngineError.launchFailed("RPC 服务不是所需的 aria2-next \(Aria2NextDeployment.version)，请检查端口占用。")
+        }
         return
       }
-      try? await Task.sleep(for: .milliseconds(100))
+      try await Task.sleep(for: .milliseconds(100))
     }
     throw Aria2EngineError.rpcUnavailable
   }
 
-  private func stopProcess() {
-    if process?.isRunning == true {
-      process?.terminate()
+  private func stopManagedProcess(
+    requireSessionSave: Bool,
+    forAppTermination: Bool = false
+  ) async throws {
+    guard let process else {
+      launch = nil
+      appliedRuntimeOptions = nil
+      return
     }
-    process = nil
+    // Never send lifecycle RPC to an unverified service occupying our port.
+    if !hasVerifiedRPC {
+      await EngineTerminationCleanup.terminateOwnedProcess(process)
+      guard !process.isRunning else { throw Aria2EngineError.processExitTimedOut }
+      self.process = nil
+      launch = nil
+      appliedRuntimeOptions = nil
+      return
+    }
+    let config = launch
+    let shutdown = EngineProcessShutdown(
+      isRunning: { process.isRunning },
+      saveSession: { [self] in
+        guard let config else { throw Aria2EngineError.rpcUnavailable }
+        try await lifecycleRPC(
+          "aria2.saveSession", config: config, timeoutInterval: forAppTermination ? 0.4 : 5,
+        )
+      },
+      requestShutdown: { [self] in
+        guard let config else { throw Aria2EngineError.rpcUnavailable }
+        try await lifecycleRPC(
+          forAppTermination ? "aria2.forceShutdown" : "aria2.shutdown",
+          config: config, timeoutInterval: forAppTermination ? 0.2 : 1,
+        )
+      },
+      terminate: { if process.isRunning { process.terminate() } },
+    )
+    let timing = forAppTermination
+      ? EngineProcessShutdown.Timing(
+        gracefulTimeout: .milliseconds(200),
+        terminationTimeout: .milliseconds(100),
+        pollInterval: .milliseconds(10),
+      )
+      : EngineProcessShutdown.Timing(gracefulTimeout: .seconds(5))
+    try await shutdown.run(requireSessionSave: requireSessionSave, timing: timing)
+    guard self.process === process else { return }
+    self.process = nil
+    hasVerifiedRPC = false
+    launch = nil
+    appliedRuntimeOptions = nil
   }
 
+  private func lifecycleRPC(_ method: String, config: LaunchConfig, timeoutInterval: TimeInterval) async throws {
+    let result = try await rpc(
+      port: config.port,
+      method: method,
+      params: authenticationParameters(config.secret),
+      timeoutInterval: timeoutInterval,
+    )
+    guard result as? String == "OK" else {
+      throw Aria2EngineError.rpcFailed("\(method) 未返回成功确认。")
+    }
+  }
   private func applyOptions(_ config: LaunchConfig) async throws {
     let next = config.runtimeOptions
     guard next != appliedRuntimeOptions else { return }
 
-    _ = try await rpc(
+    let result = try await rpc(
       port: config.port,
       method: "aria2.changeGlobalOption",
-      params: [
-        token(config.secret),
-        [
-          "max-concurrent-downloads": "\(next.maxConcurrentDownloads)",
-          "max-connection-per-server": "\(next.maxConnectionsPerServer)",
-          "max-download-limit": "\(next.maxDownloadSpeedBytes)",
-        ],
+      params: authenticationParameters(config.secret) + [
+        next.speedLimits.globalOptions
+          .merging(next.streamOptions.globalOptions) { _, new in new }
+          .merging(next.certificatePolicy.options) { _, new in new }
+          .merging(["max-concurrent-downloads": "\(next.maxConcurrentDownloads)"]) { _, new in new },
       ],
     )
 
+    guard result as? String == "OK" else {
+      throw Aria2EngineError.rpcFailed("应用下载设置未返回成功确认。")
+    }
+
     if let previous = appliedRuntimeOptions {
-      var taskOptions: [String: String] = [:]
-      if previous.maxConnectionsPerServer != next.maxConnectionsPerServer {
-        taskOptions["max-connection-per-server"] = "\(next.maxConnectionsPerServer)"
-      }
-      if previous.maxDownloadSpeedBytes != next.maxDownloadSpeedBytes {
-        taskOptions["max-download-limit"] = "\(next.maxDownloadSpeedBytes)"
+      var taskOptions = next.speedLimits.taskOptions(comparedTo: previous.speedLimits)
+      if previous.streamOptions.connections != next.streamOptions.connections {
+        taskOptions["stream-max-connections"] = "\(next.streamOptions.connections)"
       }
       if !taskOptions.isEmpty {
         await applyOptionsToLiveTasks(taskOptions, config: config)
@@ -343,43 +501,61 @@ public actor Aria2Engine {
   }
 
   private func applyOptionsToLiveTasks(_ options: [String: String], config: LaunchConfig) async {
-    let secret = token(config.secret)
-    let active = (try? await entries(port: config.port, method: "aria2.tellActive", params: [secret])) ?? []
+    let authentication = authenticationParameters(config.secret)
+    let active = (try? await entries(port: config.port, method: "aria2.tellActive", params: authentication)) ?? []
     let waiting = (try? await entries(
       port: config.port,
       method: "aria2.tellWaiting",
-      params: [secret, 0, 500],
+      params: authentication + [0, 500],
     )) ?? []
 
     let gids = (active + waiting).compactMap { $0["gid"] as? String }
     for gid in Set(gids) {
-      _ = try? await rpc(
-        port: config.port,
-        method: "aria2.changeOption",
-        params: [secret, gid, options],
-      )
+      do {
+        let result = try await rpc(
+          port: config.port,
+          method: "aria2.changeOption",
+          params: authentication + [gid, options],
+        )
+        guard result as? String == "OK" else { continue }
+        if taskOptions[gid] != nil {
+          taskOptions[gid]?.merge(DownloadTaskActions.supportedOptions(options)) { _, new in new }
+        }
+      } catch {
+        // Keep the last confirmed options if this task rejected the update.
+      }
     }
   }
 
   private func fetchTasks(_ config: LaunchConfig) async throws -> [DownloadTask] {
-    let secret = token(config.secret)
-    let active = try await entries(port: config.port, method: "aria2.tellActive", params: [secret])
+    let authentication = authenticationParameters(config.secret)
+    let active = try await entries(port: config.port, method: "aria2.tellActive", params: authentication)
     let waiting = try await entries(
       port: config.port,
       method: "aria2.tellWaiting",
-      params: [secret, 0, 500],
+      params: authentication + [0, 500],
     )
     let stopped = try await entries(
       port: config.port,
       method: "aria2.tellStopped",
-      params: [secret, 0, 500],
+      params: authentication + [0, 500],
     )
     var seen = Set<String>()
     var tasks: [DownloadTask] = []
     for item in active + waiting + stopped.reversed() {
-      guard let task = makeTask(item), seen.insert(task.id).inserted else { continue }
+      guard var task = makeTask(item), seen.insert(task.id).inserted else { continue }
+      if taskOptions[task.id] == nil {
+        // Snapshot effective options while aria2 knows this task; exclude auth/proxy options.
+        if let options = try? await rpc(
+          port: config.port, method: "aria2.getOption", params: authentication + [task.id], timeoutInterval: 2
+        ) as? [String: String] {
+          taskOptions[task.id] = DownloadTaskActions.supportedOptions(options)
+        }
+      }
+      task.downloadOptions = taskOptions[task.id]
       tasks.append(task)
     }
+    taskOptions = taskOptions.filter { seen.contains($0.key) }
     return tasks
   }
 
@@ -407,7 +583,7 @@ public actor Aria2Engine {
     return DownloadTask(
       id: gid,
       title: title.isEmpty ? gid : title,
-      sourceURL: URL(string: uri) ?? URL(string: "https://localhost/")!,
+      sourceURL: uri.isEmpty ? nil : URL(string: uri),
       filePath: path,
       status: status,
       progress: progress,
@@ -418,7 +594,12 @@ public actor Aria2Engine {
     )
   }
 
-  private func rpc(port: Int, method: String, params: [Any]) async throws -> Any? {
+  private func rpc(
+    port: Int,
+    method: String,
+    params: [Any],
+    timeoutInterval: TimeInterval = 60
+  ) async throws -> Any? {
     let body: [String: Any] = [
       "jsonrpc": "2.0",
       "id": "aria",
@@ -427,6 +608,7 @@ public actor Aria2Engine {
     ]
     var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/jsonrpc")!)
     request.httpMethod = "POST"
+    request.timeoutInterval = timeoutInterval
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     do {
       request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -443,12 +625,13 @@ public actor Aria2Engine {
     } catch let error as Aria2EngineError {
       throw error
     } catch {
+      try Task.checkCancellation()
       throw Aria2EngineError.rpcFailed(error.localizedDescription)
     }
   }
 
-  private func token(_ secret: String) -> String {
-    "token:\(secret)"
+  private func authenticationParameters(_ secret: String) -> [Any] {
+    Aria2RPCAuthentication(secret: secret).tokenParameters
   }
 
   private func setState(_ newState: EngineState) async {
@@ -467,9 +650,9 @@ public actor Aria2Engine {
   private static func isRecoverable(_ error: Error) -> Bool {
     guard let engineError = error as? Aria2EngineError else { return true }
     switch engineError {
-    case .launchFailed, .rpcUnavailable, .rpcFailed:
+    case .launchFailed, .rpcUnavailable, .rpcFailed, .processExitTimedOut:
       return true
-    case .binaryMissing, .preparationFailed, .operationFailed:
+    case .binaryMissing, .preparationFailed, .operationFailed, .sessionSaveFailed:
       return false
     }
   }
@@ -483,24 +666,6 @@ public actor Aria2Engine {
     case 5: 15
     default: 30
     }
-  }
-
-  private func shutdown(port: Int, secret: String) async {
-    let body: [String: Any] = [
-      "jsonrpc": "2.0",
-      "id": "stop",
-      "method": "aria2.shutdown",
-      "params": ["token:\(secret)"],
-    ]
-    guard let url = URL(string: "http://127.0.0.1:\(port)/jsonrpc"),
-          let data = try? JSONSerialization.data(withJSONObject: body)
-    else { return }
-    var request = URLRequest(url: url)
-    request.httpMethod = "POST"
-    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.httpBody = data
-    request.timeoutInterval = 1
-    _ = try? await URLSession.shared.data(for: request)
   }
 
   private static func status(_ raw: String?) -> DownloadTaskStatus? {
@@ -521,14 +686,8 @@ public actor Aria2Engine {
   }
 
   private static func binaryURL() -> URL? {
-    let installed = [
-      "/opt/homebrew/bin/aria2c",
-      "/usr/local/bin/aria2c",
-    ]
-    if let path = installed.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
-      return URL(fileURLWithPath: path)
-    }
-    return Bundle.main.url(forAuxiliaryExecutable: "aria2c")
+    // Only the pinned bundled engine, never an unrelated Homebrew aria2 installation.
+    Aria2NextDeployment.bundledBinary()
   }
 
   private static var supportDirectory: URL {
@@ -538,31 +697,24 @@ public actor Aria2Engine {
 
   private static func currentConfig() -> LaunchConfig {
     let defaults = UserDefaults.standard
-    var secret = defaults.string(forKey: AppPreferenceKey.rpcSecret) ?? ""
-    if secret.isEmpty {
-      secret = RPCSecretGenerator.make()
-      defaults.set(secret, forKey: AppPreferenceKey.rpcSecret)
-    }
+    let secret = Aria2RPCAuthentication(defaults: defaults).secret
     let rawPort = defaults.object(forKey: AppPreferenceKey.rpcPort) as? Int ?? AppDefaults.rpcPort
     let port = min(max(rawPort, 1), 65_535)
     let directory = (defaults.string(forKey: AppPreferenceKey.downloadDirectory) ?? AppDefaults.downloadDirectory)
       as NSString
     let rawConcurrent = defaults.object(forKey: AppPreferenceKey.maxConcurrentDownloads) as? Int
       ?? AppDefaults.maxConcurrentDownloads
-    let rawConnections = defaults.object(forKey: AppPreferenceKey.maxConnectionsPerServer) as? Int
-      ?? AppDefaults.maxConnectionsPerServer
-    let speedKB = defaults.object(forKey: AppPreferenceKey.maxDownloadSpeedKB) as? Int ?? AppDefaults.maxDownloadSpeedKB
-    let safeSpeedKB = min(max(speedKB, 0), Int.max / 1024)
     return LaunchConfig(
       port: port,
       secret: secret,
       directory: directory.expandingTildeInPath,
       maxConcurrentDownloads: min(max(rawConcurrent, 1), 32),
-      maxConnectionsPerServer: min(max(rawConnections, 1), 16),
-      maxDownloadSpeedBytes: safeSpeedKB * 1024,
-      supportDirectory: supportDirectory,
-      sessionFile: supportDirectory.appendingPathComponent("aria2.session"),
-      inputFile: supportDirectory.appendingPathComponent("aria2.session.input"),
+      speedLimits: DownloadSpeedLimits(defaults: defaults),
+      streamOptions: Aria2NextOptions(defaults: defaults),
+      certificatePolicy: DownloadCertificatePolicy(defaults: defaults),
+      supportDirectory: Aria2NextDeployment.engineDirectory(in: supportDirectory),
+      sessionFile: Aria2NextDeployment.engineDirectory(in: supportDirectory).appendingPathComponent("session"),
+      inputFile: Aria2NextDeployment.engineDirectory(in: supportDirectory).appendingPathComponent("session.input"),
     )
   }
 }
@@ -572,8 +724,9 @@ nonisolated private struct LaunchConfig: Equatable, Sendable {
   var secret: String
   var directory: String
   var maxConcurrentDownloads: Int
-  var maxConnectionsPerServer: Int
-  var maxDownloadSpeedBytes: Int
+  var speedLimits: DownloadSpeedLimits
+  var streamOptions: Aria2NextOptions
+  var certificatePolicy: DownloadCertificatePolicy
   var supportDirectory: URL
   var sessionFile: URL
   var inputFile: URL
@@ -581,8 +734,9 @@ nonisolated private struct LaunchConfig: Equatable, Sendable {
   var runtimeOptions: RuntimeOptions {
     RuntimeOptions(
       maxConcurrentDownloads: maxConcurrentDownloads,
-      maxConnectionsPerServer: maxConnectionsPerServer,
-      maxDownloadSpeedBytes: maxDownloadSpeedBytes
+      speedLimits: speedLimits,
+      streamOptions: streamOptions,
+      certificatePolicy: certificatePolicy
     )
   }
 
@@ -598,6 +752,7 @@ nonisolated private struct LaunchConfig: Equatable, Sendable {
 
 nonisolated private struct RuntimeOptions: Equatable, Sendable {
   var maxConcurrentDownloads: Int
-  var maxConnectionsPerServer: Int
-  var maxDownloadSpeedBytes: Int
+  var speedLimits: DownloadSpeedLimits
+  var streamOptions: Aria2NextOptions
+  var certificatePolicy: DownloadCertificatePolicy
 }

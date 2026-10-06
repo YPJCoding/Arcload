@@ -14,8 +14,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     guard let session = Self.session else { return .terminateNow }
 
     isTerminating = true
+    // Give immediate visual feedback before the first asynchronous cleanup step.
+    session.prepareForTermination()
     Task { @MainActor in
-      await session.stop()
+      await session.stopForAppTermination()
       sender.reply(toApplicationShouldTerminate: true)
     }
     return .terminateLater

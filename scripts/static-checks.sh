@@ -66,16 +66,24 @@ grep -q -- '"--no-conf=true"' Sources/AppCore/Engine/Aria2Engine.swift || {
   echo "error: aria2 must ignore user-level aria2.conf to keep runtime configuration self-contained" >&2
   exit 1
 }
-grep -q -- '"--split=16"' Sources/AppCore/Engine/Aria2Engine.swift || {
-  echo "error: aria2 split count must be explicitly owned by the app" >&2
+grep -q 'config.streamOptions.launchArguments' Sources/AppCore/Engine/Aria2Engine.swift \
+  && grep -q -- '"--stream-max-connections=' Sources/AppCore/Engine/Aria2NextOptions.swift \
+  && grep -q -- '"--stream-max-range-size=' Sources/AppCore/Engine/Aria2NextOptions.swift || {
+  echo "error: native aria2-next stream options must be explicitly owned by the app" >&2
   exit 1
 }
-grep -q -- '"--min-split-size=1M"' Sources/AppCore/Engine/Aria2Engine.swift || {
-  echo "error: aria2 minimum split size must be explicitly owned by the app" >&2
+grep -q 'Aria2NextDeployment.bundledBinary()' Sources/AppCore/Engine/Aria2Engine.swift || {
+  echo "error: runtime must use the pinned bundled aria2-next engine" >&2
   exit 1
 }
-grep -q -- '"--check-certificate=false"' Sources/AppCore/Engine/Aria2Engine.swift || {
-  echo "error: aria2 certificate-check setting must remain explicitly configured by the app" >&2
+[[ -x Resources/aria2-next && -f Resources/aria2-next-release.json && -f Resources/aria2-next-COPYING ]] || {
+  echo "error: pinned aria2-next distribution is incomplete" >&2
+  exit 1
+}
+grep -Fq 'config.certificatePolicy.launchArguments' Sources/AppCore/Engine/Aria2Engine.swift \
+  && grep -Fq -- '--check-certificate=' Sources/AppCore/Engine/DownloadCertificatePolicy.swift \
+  && grep -Fq 'public static let checkCertificate = true' Sources/AppCore/Application/AppPreferenceKey.swift || {
+  echo "error: aria2 certificate-check setting must be explicitly configured and default to enabled" >&2
   exit 1
 }
 

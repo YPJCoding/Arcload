@@ -4,48 +4,33 @@ import Foundation
 @MainActor
 @main
 enum SmokeTests {
-  static func main() {
+  static func main() async {
+    let parsed = DownloadInputParser.parse("https://example.com/a.bin\nhttps://example.com/a.bin\ninvalid")
+    guard parsed.entries.count == 1, parsed.duplicateCount == 1, parsed.issues.count == 1 else {
+      fputs("download input parsing failed\n", stderr)
+      exit(1)
+    }
+
     let model = AppModel()
-    let initialCount = model.tasks.count
-    model.addDownload(urlString: "https://example.com/smoke.bin")
-    guard model.tasks.count == initialCount + 1 else {
-      fputs("addDownload failed\n", stderr)
+    do {
+      try await model.addDownload(url: parsed.entries[0].url)
+      fputs("adding without an engine must fail\n", stderr)
       exit(1)
-    }
-    let firstID = model.tasks.first!.id
-    model.addDownload(urlString: "https://example.com/smoke-2.bin")
-    guard model.tasks.count == initialCount + 2 else {
-      fputs("second addDownload failed\n", stderr)
-      exit(1)
+    } catch {
+      guard model.tasks.isEmpty else {
+        fputs("failed submission created a placeholder task\n", stderr)
+        exit(1)
+      }
     }
 
-    let secondID = model.tasks.first!.id
-    model.selectedTaskIDs = [firstID, secondID]
-
-    guard model.selectedTasks.count == 2, model.canPauseAll, model.canPauseSelectedTasks else {
-      fputs("multi-selection pause availability failed\n", stderr)
-      exit(1)
-    }
-
-    model.pauseSelectedTasks()
-    guard model.selectedTasks.allSatisfy({ $0.status == .paused }),
-          model.canResumeAll,
-          model.canResumeSelectedTasks
+    let tasks = [
+      DownloadTask(title: "a.bin", sourceURL: parsed.entries[0].url, filePath: "", status: .waiting, progress: 0),
+      DownloadTask(title: "b.bin", sourceURL: parsed.entries[0].url, filePath: "", status: .complete, progress: 1),
+    ]
+    guard MainSidebarItem.active.filteredTasks(from: tasks).count == 1,
+          MainSidebarItem.completed.filteredTasks(from: tasks).count == 1
     else {
-      fputs("pause selected tasks failed\n", stderr)
-      exit(1)
-    }
-
-    model.resumeSelectedTasks()
-    guard model.selectedTasks.allSatisfy({ $0.status == .downloading }), model.canPauseAll else {
-      fputs("resume selected tasks failed\n", stderr)
-      exit(1)
-    }
-
-    model.requestRemoveSelectedTasks()
-    model.confirmPendingDeletion()
-    guard model.tasks.count == initialCount, model.selectedTaskIDs.isEmpty else {
-      fputs("remove selected tasks failed\n", stderr)
+      fputs("task filtering failed\n", stderr)
       exit(1)
     }
     print("smoke tests passed")

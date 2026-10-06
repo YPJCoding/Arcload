@@ -1,13 +1,18 @@
 import AppCore
 import AppKit
 import Observation
+import SwiftUI
 
 @MainActor
 final class MenuBarController: NSObject {
   private let windowManager: MainWindowManager
   private let model: AppModel
   private var statusItem: NSStatusItem?
-  private weak var downloadDot: StatusDotView?
+  private let iconState = StatusIconState()
+  private var iconView: StatusIconHostingView?
+  private var presentation = MenuBarDownloadPresentation()
+  private var completionResetTask: Task<Void, Never>?
+  private var isInvalidated = false
 
   init(windowManager: MainWindowManager, model: AppModel) {
     self.windowManager = windowManager
@@ -17,52 +22,64 @@ final class MenuBarController: NSObject {
     observeDownloads()
   }
 
-  func refreshIcon() {
-    guard let button = statusItem?.button else { return }
-
-    if button.image == nil {
-      let configuration = NSImage.SymbolConfiguration(pointSize: 18, weight: .regular)
-      let image = NSImage(
-        systemSymbolName: "arrow.down.circle.fill",
-        accessibilityDescription: "Arcload"
-      )?.withSymbolConfiguration(configuration)
-      image?.isTemplate = true
-      button.image = image
+  func invalidate() {
+    isInvalidated = true
+    completionResetTask?.cancel()
+    completionResetTask = nil
+    iconState.display = .idle
+    iconView?.removeFromSuperview()
+    iconView = nil
+    if let statusItem {
+      statusItem.menu?.cancelTracking()
+      NSStatusBar.system.removeStatusItem(statusItem)
     }
-
-    let isDownloading = model.tasks.contains { $0.status == .downloading }
-    updateDownloadDot(on: button, isVisible: isDownloading)
-    button.image?.accessibilityDescription = isDownloading
-      ? "Arcload，正在下载"
-      : "Arcload"
+    statusItem = nil
   }
 
-  private func updateDownloadDot(on button: NSStatusBarButton, isVisible: Bool) {
-    if !isVisible {
-      downloadDot?.removeFromSuperview()
-      return
-    }
+  func refreshIcon() {
+    guard !isInvalidated, let button = statusItem?.button else { return }
 
-    if downloadDot == nil {
-      let dot = StatusDotView(frame: .zero)
-      dot.translatesAutoresizingMaskIntoConstraints = false
-      button.addSubview(dot)
-      NSLayoutConstraint.activate([
-        dot.widthAnchor.constraint(equalToConstant: 4),
-        dot.heightAnchor.constraint(equalToConstant: 4),
-        dot.centerXAnchor.constraint(equalTo: button.centerXAnchor),
-        dot.bottomAnchor.constraint(equalTo: button.bottomAnchor, constant: -3),
-      ])
-      downloadDot = dot
+    let previousDeadline = presentation.completionDeadline
+    let display = presentation.update(tasks: model.tasks, now: .now)
+    if iconState.display != display {
+      iconState.display = display
+    }
+    let label: String
+    switch display {
+    case .idle: label = "Arcload"
+    case .downloading: label = "Arcload，正在下载"
+    case .completed: label = "Arcload，下载完成"
+    }
+    button.setAccessibilityLabel(label)
+
+    if previousDeadline != presentation.completionDeadline {
+      scheduleCompletionReset(at: presentation.completionDeadline)
+    }
+  }
+
+  private func scheduleCompletionReset(at deadline: ContinuousClock.Instant?) {
+    completionResetTask?.cancel()
+    completionResetTask = nil
+    guard let deadline else { return }
+
+    completionResetTask = Task { @MainActor [weak self] in
+      do {
+        try await Task.sleep(until: deadline, clock: .continuous)
+      } catch {
+        return
+      }
+      guard let self, !self.isInvalidated, self.presentation.completionDeadline == deadline else { return }
+      self.refreshIcon()
     }
   }
 
   private func observeDownloads() {
+    guard !isInvalidated else { return }
     withObservationTracking {
       _ = model.tasks
     } onChange: { [weak self] in
       Task { @MainActor in
-        guard let self else { return }
+        guard let self, !self.isInvalidated else { return }
         self.refreshIcon()
         self.observeDownloads()
       }
@@ -70,9 +87,22 @@ final class MenuBarController: NSObject {
   }
 
   private func installStatusItem() {
-    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let item = NSStatusBar.system.statusItem(withLength: 26)
     item.menu = makeMenu()
     statusItem = item
+
+    if let button = item.button {
+      let view = StatusIconHostingView(rootView: StatusIconView(state: iconState))
+      view.translatesAutoresizingMaskIntoConstraints = false
+      button.addSubview(view)
+      NSLayoutConstraint.activate([
+        view.leadingAnchor.constraint(equalTo: button.leadingAnchor),
+        view.trailingAnchor.constraint(equalTo: button.trailingAnchor),
+        view.topAnchor.constraint(equalTo: button.topAnchor),
+        view.bottomAnchor.constraint(equalTo: button.bottomAnchor),
+      ])
+      iconView = view
+    }
     refreshIcon()
   }
 
@@ -104,25 +134,35 @@ final class MenuBarController: NSObject {
   }
 }
 
-private final class StatusDotView: NSView {
-  override init(frame frameRect: NSRect) {
-    super.init(frame: frameRect)
-    configure()
-  }
+@Observable
+private final class StatusIconState {
+  var display: MenuBarDownloadPresentation.DisplayState = .idle
+}
 
-  required init?(coder: NSCoder) {
-    super.init(coder: coder)
-    configure()
-  }
+private struct StatusIconView: View {
+  let state: StatusIconState
 
+  var body: some View {
+    Group {
+      switch state.display {
+      case .downloading(let progress):
+        DownloadProgressIcon(progress: progress, size: 17)
+      case .completed:
+        DownloadProgressIcon(progress: 1, showsCompletion: true, size: 17)
+      case .idle:
+        Image(systemName: "arrow.down.circle.fill")
+      }
+    }
+      .font(.system(size: 17, weight: .regular))
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
+      .allowsHitTesting(false)
+      .accessibilityHidden(true)
+  }
+}
+
+private final class StatusIconHostingView: NSHostingView<StatusIconView> {
+  // Leave all mouse handling, including the menu, to NSStatusBarButton.
   override func hitTest(_ point: NSPoint) -> NSView? {
     nil
-  }
-
-  private func configure() {
-    wantsLayer = true
-    layer?.backgroundColor = NSColor.systemGreen.cgColor
-    layer?.cornerRadius = 2
-    layer?.opacity = 1
   }
 }

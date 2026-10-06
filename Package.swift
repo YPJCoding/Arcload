@@ -18,8 +18,10 @@ let package = Package(
     .executable(name: "Arcload", targets: ["ArcloadApp"]),
   ],
   targets: [
+    .systemLibrary(name: "CSQLite", path: "Sources/CSQLite"),
     .target(
       name: "AppCore",
+      dependencies: ["CSQLite"],
       path: "Sources/AppCore",
       swiftSettings: modernSwiftSettings,
     ),
@@ -27,6 +29,12 @@ let package = Package(
       name: "ArcloadApp",
       dependencies: ["AppCore"],
       path: "Sources/Application",
+      swiftSettings: modernSwiftSettings,
+    ),
+    .testTarget(
+      name: "AppCoreTests",
+      dependencies: ["AppCore", "CSQLite"],
+      path: "Tests/AppCoreTests",
       swiftSettings: modernSwiftSettings,
     ),
     .executableTarget(

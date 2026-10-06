@@ -1,4 +1,5 @@
 import AppCore
+import AppKit
 
 @MainActor
 final class AppSession {
@@ -8,6 +9,7 @@ final class AppSession {
   let windowManager = MainWindowManager()
   private var menuBarController: MenuBarController?
   private var didStart = false
+  private var isTerminating = false
 
   private init() {
     BrandMigration.runIfNeeded()
@@ -16,13 +18,24 @@ final class AppSession {
   }
 
   func start() {
-    guard !didStart else { return }
+    guard !didStart, !isTerminating else { return }
     didStart = true
     menuBarController = MenuBarController(windowManager: windowManager, model: model)
     model.startEngine()
   }
 
-  func stop() async {
-    await model.stopEngine()
+  func prepareForTermination() {
+    guard !isTerminating else { return }
+    isTerminating = true
+    model.prepareForTermination()
+    windowManager.prepareForTermination()
+    menuBarController?.invalidate()
+    menuBarController = nil
+    // Include sheets and any other app-owned windows, not only the main window.
+    NSApp.windows.forEach { $0.orderOut(nil) }
+  }
+
+  func stopForAppTermination() async {
+    await model.stopEngine(forAppTermination: true)
   }
 }

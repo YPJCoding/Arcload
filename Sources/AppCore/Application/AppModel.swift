@@ -8,12 +8,21 @@ public final class AppModel {
   public private(set) var tasks: [DownloadTask] = []
   public var selectedTaskIDs: Set<DownloadTask.ID> = []
   public var isAddingDownload = false
+  public var downloadNotice: String?
+  public private(set) var redownloadingTaskIDs: Set<DownloadTask.ID> = []
   public var pendingDeletion: PendingDeletion?
   public var presentedError: AppAlert?
   public var sidebarSelection: MainSidebarItem = .all
   public private(set) var engineState: EngineState = .stopped
   private var engine: Aria2Engine?
   private var hasPresentedCurrentEngineFailure = false
+  private var isTerminating = false
+  private var liveTasks: [DownloadTask] = []
+  private let history: DownloadHistoryController
+  let notifications: DownloadNotificationController
+  let sleepPrevention: DownloadSleepController
+  private var hasActiveEngineDownloads = false
+  private var hasPresentedHistoryFailure = false
 
   public var isEnginePaused = false {
     didSet {
@@ -21,7 +30,18 @@ public final class AppModel {
     }
   }
 
-  public init() {
+  public convenience init() {
+    self.init(historyRepository: DownloadHistoryStore())
+  }
+
+  init(
+    historyRepository: any DownloadHistoryRepository,
+    notifications: DownloadNotificationController? = nil,
+    sleepPrevention: DownloadSleepController? = nil
+  ) {
+    history = DownloadHistoryController(repository: historyRepository)
+    self.notifications = notifications ?? DownloadNotificationController()
+    self.sleepPrevention = sleepPrevention ?? DownloadSleepController()
     isEnginePaused = UserDefaults.standard.bool(forKey: AppPreferenceKey.enginePaused)
   }
 
@@ -46,6 +66,30 @@ public final class AppModel {
     selectedTasks.contains { $0.status == .paused }
   }
 
+  var toolbarScope: DownloadToolbarScope {
+    DownloadToolbarScope(tasks: tasks, selectedIDs: selectedTaskIDs)
+  }
+
+  func pauseToolbarTasks() {
+    let scope = toolbarScope
+    guard scope.canPause else { return }
+    if scope.isSelectionScoped {
+      pauseTasks(ids: scope.pauseIDs)
+    } else {
+      pauseAll()
+    }
+  }
+
+  func resumeToolbarTasks() {
+    let scope = toolbarScope
+    guard scope.canResume else { return }
+    if scope.isSelectionScoped {
+      resumeTasks(ids: scope.resumeIDs)
+    } else {
+      resumeAll()
+    }
+  }
+
   public var canPauseAll: Bool {
     tasks.contains { $0.status == .downloading || $0.status == .waiting }
   }
@@ -58,55 +102,115 @@ public final class AppModel {
     isAddingDownload = true
   }
 
+  public func prepareForTermination() {
+    isTerminating = true
+    notifications.stop()
+    sleepPrevention.stop()
+  }
+
   public func startEngine() {
-    guard engine == nil else { return }
+    guard engine == nil, !isTerminating else { return }
     engineState = .starting
+    hasActiveEngineDownloads = false
+    sleepPrevention.update(hasActiveDownloads: false, engineState: .starting)
     let engine = Aria2Engine(
       onTasks: { [weak self] tasks in
-        self?.applyEngineTasks(tasks)
+        await self?.applyEngineTasks(tasks)
       },
       onState: { [weak self] state in
         self?.applyEngineState(state)
+      },
+      onSubmitted: { [weak self] id in
+        self?.notifications.registerSubmission(id)
       }
     )
     self.engine = engine
     Task {
+      await notifications.refreshAuthorization()
+      await loadHistory()
+      guard !isTerminating else { return }
       await engine.start()
     }
   }
 
-  public func stopEngine() async {
-    guard let engine else { return }
-    self.engine = nil
-    await engine.stop()
+  public func stopEngine(forAppTermination: Bool = false) async {
+    if forAppTermination { prepareForTermination() }
+    hasActiveEngineDownloads = false
+    sleepPrevention.update(hasActiveDownloads: false, engineState: .stopped)
+    if let engine {
+      self.engine = nil
+      if forAppTermination {
+        await engine.stopForAppTermination()
+      } else {
+        await engine.stop()
+      }
+    }
+    await saveHistory()
   }
 
-  public func addDownload(urlString: String) {
-    let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard let url = URL(string: trimmed), url.scheme == "http" || url.scheme == "https" else { return }
-    if let engine {
-      let paused = isEnginePaused
-      Task {
-        do {
-          try await engine.add(url: url, paused: paused)
-        } catch {
-          presentError(title: "无法添加下载", error: error)
-        }
-      }
+  public func addDownload(url: URL) async throws {
+    guard let engine, engineState == .running else {
+      throw Aria2EngineError.operationFailed("下载引擎尚未就绪，请稍后重试。")
+    }
+    try await engine.add(url: url, paused: isEnginePaused)
+  }
+
+  public func copyDownloadLinks(for tasks: [DownloadTask]) {
+    let links = DownloadTaskActions.links(in: tasks)
+    guard !links.isEmpty else { return }
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(links, forType: .string)
+    downloadNotice = "已复制下载链接"
+  }
+
+  public func redownloadTasks(_ tasks: [DownloadTask]) async {
+    guard let engine, engineState == .running, !isTerminating else {
+      presentError(title: "无法重新下载", message: "下载引擎尚未就绪，请稍后重试。")
       return
     }
+    let paused = isEnginePaused
+    await redownloadTasks(tasks) { url, options in
+      try await engine.add(url: url, paused: paused, options: options)
+    }
+  }
 
-    let fileName = url.lastPathComponent.isEmpty ? "download.bin" : url.lastPathComponent
-    let path = (expandedDownloadDirectory() as NSString).appendingPathComponent(fileName)
-    let task = DownloadTask(
-      title: fileName,
-      sourceURL: url,
-      filePath: path,
-      status: .waiting,
-      progress: 0,
-    )
-    tasks.insert(task, at: 0)
-    selectedTaskIDs = [task.id]
+  // The injectable submission boundary exercises batching without launching a real engine.
+  func redownloadTasks(
+    _ candidates: [DownloadTask],
+    add: @MainActor (URL, [String: String]) async throws -> String
+  ) async {
+    var seen = Set<DownloadTask.ID>()
+    let eligible = candidates.filter {
+      DownloadTaskActions.canRedownload($0) && !redownloadingTaskIDs.contains($0.id)
+        && seen.insert($0.id).inserted
+    }
+    guard !eligible.isEmpty, !isTerminating else { return }
+    let ids = Set(eligible.map(\.id))
+    redownloadingTaskIDs.formUnion(ids)
+    defer { redownloadingTaskIDs.subtract(ids) }
+    var newIDs = Set<DownloadTask.ID>()
+    var failures: [String] = []
+    for task in eligible {
+      guard !isTerminating else { break }
+      guard let url = DownloadTaskActions.sourceURL(for: task) else { continue }
+      do {
+        let gid = try await add(url, DownloadTaskActions.redownloadOptions(for: task))
+        newIDs.insert(gid)
+      } catch {
+        failures.append("\(task.title)：\(error.localizedDescription)")
+      }
+    }
+    if !newIDs.isEmpty {
+      selectedTaskIDs = newIDs
+      downloadNotice = "已重新添加 \(newIDs.count) 个下载"
+    }
+    if !failures.isEmpty {
+      presentError(
+        title: "部分任务无法重新下载",
+        message: failures.joined(separator: "\n")
+          + "\n\n原记录和文件已保留。若请求超时，服务器可能已收到任务；重试前请检查列表，避免重复下载。"
+      )
+    }
   }
 
   public func removeTask(id: DownloadTask.ID) {
@@ -114,9 +218,7 @@ public final class AppModel {
   }
 
   public func removeTasks(ids: Set<DownloadTask.ID>) {
-    guard !ids.isEmpty else { return }
-    tasks.removeAll { ids.contains($0.id) }
-    selectedTaskIDs.subtract(ids)
+    beginDeletion(tasks.filter { ids.contains($0.id) }, includesFile: false)
   }
 
   public func requestRemoveTask(id: DownloadTask.ID) {
@@ -146,13 +248,7 @@ public final class AppModel {
     let pendingTasks = tasks.filter { pendingDeletion.taskIDs.contains($0.id) }
     guard !pendingTasks.isEmpty else { return }
 
-    if let engine {
-      Task {
-        await performDeletion(pendingTasks, includesFile: pendingDeletion.includesFile, engine: engine)
-      }
-    } else {
-      performLocalDeletion(pendingTasks, includesFile: pendingDeletion.includesFile)
-    }
+    beginDeletion(pendingTasks, includesFile: pendingDeletion.includesFile)
   }
 
   public func cancelPendingDeletion() {
@@ -331,14 +427,60 @@ public final class AppModel {
     return (stored as NSString).expandingTildeInPath
   }
 
-  private func applyEngineTasks(_ incoming: [DownloadTask]) {
-    let incomingIDs = Set(incoming.map(\.id))
-    tasks = incoming
-    selectedTaskIDs.formIntersection(incomingIDs)
+  func loadHistory() async {
+    do {
+      try await history.load()
+      rebuildTasks()
+      hasPresentedHistoryFailure = false
+    } catch {
+      reportHistoryFailure(error)
+    }
   }
 
-  private func applyEngineState(_ state: EngineState) {
+  func applyEngineTasks(_ incoming: [DownloadTask]) async {
+    guard !isTerminating else { return }
+    hasActiveEngineDownloads = incoming.contains { $0.status == .downloading }
+    sleepPrevention.update(hasActiveDownloads: hasActiveEngineDownloads, engineState: engineState)
+    let incomingIDs = Set(incoming.map(\.id))
+    // Keep rows stable during removal, even when aria2 publishes the removal before SQLite commits.
+    let deleting = liveTasks.filter { history.deletingIDs.contains($0.id) && !incomingIDs.contains($0.id) }
+    liveTasks = incoming + deleting
+    notifications.observe(incoming, excluding: history.deletingIDs.union(history.removedIDs))
+    history.observe(incoming)
+    rebuildTasks()
+    await saveHistory()
+    rebuildTasks()
+  }
+
+  private func rebuildTasks() {
+    tasks = history.merged(with: liveTasks)
+    selectedTaskIDs.formIntersection(Set(tasks.map(\.id)))
+  }
+
+  private func saveHistory() async {
+    do {
+      try await history.flush()
+      hasPresentedHistoryFailure = false
+    } catch {
+      reportHistoryFailure(error)
+    }
+  }
+
+  private func reportHistoryFailure(_ error: Error) {
+    guard !hasPresentedHistoryFailure else { return }
+    hasPresentedHistoryFailure = true
+    if isTerminating {
+      NSLog("Arcload: download history could not be saved during termination.")
+    } else {
+      presentError(title: "无法读写下载历史", error: error)
+    }
+  }
+
+  func applyEngineState(_ state: EngineState) {
     engineState = state
+    if state != .running { hasActiveEngineDownloads = false }
+    sleepPrevention.update(hasActiveDownloads: hasActiveEngineDownloads, engineState: state)
+    guard !isTerminating else { return }
 
     switch state {
     case .running, .stopped, .starting:
@@ -363,27 +505,45 @@ public final class AppModel {
   }
 
   private func presentError(title: String, message: String) {
+    guard !isTerminating else { return }
     presentedError = AppAlert(title: title, message: message)
+  }
+
+  @discardableResult
+  func beginDeletion(_ pendingTasks: [DownloadTask], includesFile: Bool) -> Task<Void, Never>? {
+    let eligible = pendingTasks.filter { !history.deletingIDs.contains($0.id) }
+    guard !eligible.isEmpty else { return nil }
+    history.deletingIDs.formUnion(eligible.map(\.id))
+    let engine = engine
+    return Task {
+      await performDeletion(eligible, includesFile: includesFile, engine: engine)
+    }
   }
 
   private func performDeletion(
     _ pendingTasks: [DownloadTask],
     includesFile: Bool,
-    engine: Aria2Engine
+    engine: Aria2Engine?
   ) async {
-    var removedIDs = Set<DownloadTask.ID>()
+    let ids = Set(pendingTasks.map(\.id))
+    defer { history.deletingIDs.subtract(ids) }
     var removeFailures: [String] = []
     var fileFailures: [String] = []
 
     for task in pendingTasks {
       do {
-        try await engine.remove(gid: task.id, status: task.status)
+        // A history-only row does not require a running aria2 process.
+        let isTerminal = task.status == .complete || task.status == .error
+        if liveTasks.contains(where: { $0.id == task.id }), !isTerminal || engineState == .running {
+          guard let engine else { throw Aria2EngineError.rpcUnavailable }
+          try await engine.remove(gid: task.id, status: task.status)
+        }
+        try await history.remove(ids: [task.id])
       } catch {
-        removeFailures.append(task.title)
+        removeFailures.append("\(task.title)：\(error.localizedDescription)")
         continue
       }
 
-      removedIDs.insert(task.id)
       if includesFile {
         do {
           try deleteFileIfPresent(at: task.filePath)
@@ -391,46 +551,20 @@ public final class AppModel {
           fileFailures.append(task.title)
         }
       }
+      liveTasks.removeAll { $0.id == task.id }
+      selectedTaskIDs.remove(task.id)
+      rebuildTasks()
     }
 
-    removeTasks(ids: removedIDs)
-
+    var messages: [String] = []
     if !removeFailures.isEmpty {
-      await engine.refreshTasks()
-      presentError(
-        title: "部分下载无法移除",
-        message: "以下任务仍保留在列表中：\n" + removeFailures.joined(separator: "\n")
-      )
-    } else if !fileFailures.isEmpty {
-      presentError(
-        title: "部分文件无法删除",
-        message: "任务已移除，但以下本地文件未能移到废纸篓：\n" + fileFailures.joined(separator: "\n")
-      )
+      messages.append("以下任务未能完全移除：\n" + removeFailures.joined(separator: "\n"))
     }
-  }
-
-  private func performLocalDeletion(_ pendingTasks: [DownloadTask], includesFile: Bool) {
-    var removableIDs = Set<DownloadTask.ID>()
-    var fileFailures: [String] = []
-
-    for task in pendingTasks {
-      if includesFile {
-        do {
-          try deleteFileIfPresent(at: task.filePath)
-        } catch {
-          fileFailures.append(task.title)
-          continue
-        }
-      }
-      removableIDs.insert(task.id)
-    }
-
-    removeTasks(ids: removableIDs)
     if !fileFailures.isEmpty {
-      presentError(
-        title: "部分文件无法删除",
-        message: "以下任务仍保留在列表中：\n" + fileFailures.joined(separator: "\n")
-      )
+      messages.append("任务已移除，但以下文件未能移到废纸篓：\n" + fileFailures.joined(separator: "\n"))
+    }
+    if !messages.isEmpty {
+      presentError(title: "部分操作未完成", message: messages.joined(separator: "\n\n"))
     }
   }
 

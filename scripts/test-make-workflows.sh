@@ -43,6 +43,7 @@ reject_call 'xcodebuild\|xcodegen'
 
 : > "$log"
 run_make test >/dev/null
+require_call '^swift test --arch arm64$'
 require_call '^swift run --arch arm64 SmokeTests$'
 reject_call 'xcodebuild\|xcodegen'
 

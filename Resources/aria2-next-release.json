@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/AnInsomniacy/aria2-next",
+  "version": "2.8.6",
+  "platform": "macos-arm64",
+  "asset": "https://github.com/AnInsomniacy/aria2-next/releases/download/v2.8.6/aria2-next-2.8.6-macos-arm64",
+  "sha256": "6767bc6e79e22dbc491fe7bbcd36daca9dc0fb3b28abca7b9a9cfb8e6e67ece5",
+  "checksums": "https://github.com/AnInsomniacy/aria2-next/releases/download/v2.8.6/aria2-next-2.8.6-checksums.sha256",
+  "source": "https://github.com/AnInsomniacy/aria2-next/archive/refs/tags/v2.8.6.tar.gz"
+}

@@ -5,6 +5,7 @@ struct ArcloadCommands: Commands {
   @Environment(\.openWindow) private var openWindow
   @Environment(\.openSettings) private var openSettings
   @Bindable var model: AppModel
+  @FocusedValue(\.focusDownloadSearch) private var focusDownloadSearch
   let windowManager: MainWindowManager
 
   var body: some Commands {
@@ -21,6 +22,14 @@ struct ArcloadCommands: Commands {
         windowManager.showMainWindow()
       }
       .keyboardShortcut("n", modifiers: .command)
+    }
+
+    CommandGroup(after: .textEditing) {
+      Button("搜索下载") {
+        focusDownloadSearch?()
+      }
+      .keyboardShortcut("f", modifiers: .command)
+      .disabled(focusDownloadSearch == nil)
     }
 
     CommandMenu("下载") {

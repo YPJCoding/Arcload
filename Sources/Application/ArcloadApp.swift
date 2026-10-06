@@ -35,6 +35,7 @@ private struct MainWindowRoot: View {
 
   var body: some View {
     MainWindowView(model: session.model)
+      // Keep the split view flexible; an outer minimum-width frame disrupted sidebar transitions.
       .background {
         WindowAccessor { window in
           session.windowManager.attach(window)
@@ -52,7 +53,7 @@ private struct SettingsRoot: View {
   let session: AppSession
 
   var body: some View {
-    SettingsView()
+    SettingsView(model: session.model)
       .background {
         WindowAccessor { window in
           session.windowManager.attachSettings(window)

@@ -7,7 +7,7 @@ public enum AppTheme {
   }
 
   public enum Metrics {
-    public static let mainWindowWidth = 900.0
+    public static let mainWindowWidth = 945.0
     public static let mainWindowHeight = 600.0
   }
 }

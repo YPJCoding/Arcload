@@ -1,6 +1,6 @@
 import Foundation
 
-nonisolated public enum DownloadTaskStatus: String, CaseIterable, Sendable {
+nonisolated public enum DownloadTaskStatus: String, CaseIterable, Codable, Sendable {
   case waiting
   case downloading
   case paused
@@ -28,10 +28,10 @@ nonisolated public enum DownloadTaskStatus: String, CaseIterable, Sendable {
   }
 }
 
-nonisolated public struct DownloadTask: Identifiable, Hashable, Sendable {
+nonisolated public struct DownloadTask: Identifiable, Hashable, Codable, Sendable {
   public let id: String
   public var title: String
-  public var sourceURL: URL
+  public var sourceURL: URL?
   public var filePath: String
   public var status: DownloadTaskStatus
   public var progress: Double
@@ -39,14 +39,25 @@ nonisolated public struct DownloadTask: Identifiable, Hashable, Sendable {
   public var completedBytes: Int64
   public var speedBytesPerSecond: Int64
   public var errorMessage: String?
+  /// Optional for compatibility with history snapshots written by older versions.
+  public var downloadOptions: [String: String]?
 
   public var sortSize: Int64 { totalBytes ?? completedBytes }
   public var statusLabel: String { status.label }
 
+  public var remainingSeconds: TimeInterval? {
+    guard status == .downloading,
+          let totalBytes, totalBytes > 0,
+          completedBytes >= 0, completedBytes < totalBytes,
+          speedBytesPerSecond > 0
+    else { return nil }
+    return Double(totalBytes - completedBytes) / Double(speedBytesPerSecond)
+  }
+
   public init(
     id: String = UUID().uuidString,
     title: String,
-    sourceURL: URL,
+    sourceURL: URL?,
     filePath: String,
     status: DownloadTaskStatus,
     progress: Double,
@@ -54,6 +65,7 @@ nonisolated public struct DownloadTask: Identifiable, Hashable, Sendable {
     completedBytes: Int64 = 0,
     speedBytesPerSecond: Int64 = 0,
     errorMessage: String? = nil,
+    downloadOptions: [String: String]? = nil,
   ) {
     self.id = id
     self.title = title
@@ -65,5 +77,6 @@ nonisolated public struct DownloadTask: Identifiable, Hashable, Sendable {
     self.completedBytes = completedBytes
     self.speedBytesPerSecond = speedBytesPerSecond
     self.errorMessage = errorMessage
+    self.downloadOptions = downloadOptions
   }
 }
